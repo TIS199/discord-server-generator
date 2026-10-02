@@ -1,25 +1,20 @@
-"""
-commands.py
------------
-Registers and handles the three slash commands:
-  /create <prompt>      — generate local-AI instruction set
-  /build  <guild_id>    — paste JSON blueprint and build the server
-  /reset                — clear any in-progress session (currently no-op)
-"""
+"""Register and handle the Discord Server Generator slash commands."""
 
+import io
 import json
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 import discord
 from discord import app_commands
 
 import config
-from src.logger import logger, log_action, log_error
+from src.builder import build_server
+from src.logger import log_action, log_error, logger
+from src.nuke import format_nuke_preview, nuke_server, prepare_nuke
 from src.prompt_builder import build_prompt
 from src.validator import validate
-from src.builder import build_server
-from src.views import BuildConfirmView
+from src.views import BuildConfirmView, NukeConfirmView
 
 
 class CommandCore:
@@ -29,233 +24,381 @@ class CommandCore:
         self._rate_limiter: Dict[int, float] = {}
         self._register_commands()
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    def _has_allowed_role(self, member: discord.Member) -> bool:
+        return any(role.name in config.BOT_ALLOWED_ROLES for role in member.roles)
 
     def _check_permissions(self, interaction: discord.Interaction) -> bool:
-        if not interaction.guild or not hasattr(interaction.user, "roles"):
+        member = interaction.user
+        if not interaction.guild or not isinstance(member, discord.Member):
             return False
-        return any(
-            role.name in config.BOT_ALLOWED_ROLES
-            for role in interaction.user.roles  # type: ignore[union-attr]
+        return (
+            member.id == interaction.guild.owner_id
+            or member.guild_permissions.manage_guild
+            or self._has_allowed_role(member)
         )
 
+    async def _target_member(self, guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+        member = guild.get_member(user_id)
+        if member:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+    async def _can_manage_target(self, interaction: discord.Interaction, guild: discord.Guild) -> bool:
+        member = await self._target_member(guild, interaction.user.id)
+        if member is None:
+            return False
+        is_owner = member.id == guild.owner_id
+        has_manage_permission = member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        is_admin = member.guild_permissions.administrator
+        return is_owner or (has_manage_permission and (self._has_allowed_role(member) or is_admin))
+
     def _check_rate_limit(self, user_id: int) -> Optional[int]:
-        """Returns seconds to wait, or None if not rate-limited."""
         now = time.time()
         last = self._rate_limiter.get(user_id)
-        if last and (now - last) < config.RATE_LIMIT_SECONDS:
-            return int(config.RATE_LIMIT_SECONDS - (now - last))
+        if last is not None and now - last < config.RATE_LIMIT_SECONDS:
+            return max(1, int(config.RATE_LIMIT_SECONDS - (now - last)))
         self._rate_limiter[user_id] = now
         return None
 
-    # ── Command registration ─────────────────────────────────────────────────
-
     def _register_commands(self) -> None:
-
-        # ── /create ──────────────────────────────────────────────────────────
         @self.tree.command(
             name="create",
-            description="Generate the local-AI instruction set for a new server",
+            description="Generate local-AI instructions for a server blueprint",
         )
-        @app_commands.describe(prompt="Describe the server you want to create")
+        @app_commands.describe(prompt="Describe the Discord server you want to create")
         async def create_cmd(interaction: discord.Interaction, prompt: str) -> None:
             if not self._check_permissions(interaction):
                 await interaction.response.send_message(
-                    f"❌ You need one of these roles: {', '.join(config.BOT_ALLOWED_ROLES)}",
+                    f"You need Manage Server or one of these roles: {', '.join(config.BOT_ALLOWED_ROLES)}",
                     ephemeral=True,
                 )
                 return
-
             wait = self._check_rate_limit(interaction.user.id)
             if wait:
                 await interaction.response.send_message(
-                    f"⏳ Please wait {wait}s before using this command again.",
-                    ephemeral=True,
+                    f"Please wait {wait}s before using this command again.", ephemeral=True
                 )
                 return
 
             await interaction.response.defer(ephemeral=True, thinking=True)
-
             instruction_set = build_prompt(prompt)
-
-            # Split into chunks if over Discord's 2000-char message limit
-            chunks = [instruction_set[i:i+1900] for i in range(0, len(instruction_set), 1900)]
-
+            instruction_file = discord.File(
+                io.BytesIO(instruction_set.encode("utf-8")),
+                filename="discord-server-generator-instructions.txt",
+            )
             await interaction.followup.send(
-                "📋 **Instruction set generated!**\n"
-                "Copy the text below and paste it into your local AI (Ollama, LM Studio, etc.).\n"
-                "Then use `/build <guild_id>` to upload the AI's JSON output back here.",
+                "Your instruction set is attached. Paste it into your local AI; the AI is asked "
+                "to save the result as **server-blueprint.json** (or return raw JSON if it cannot create files).",
+                file=instruction_file,
                 ephemeral=True,
             )
-
-            for chunk in chunks:
-                await interaction.followup.send(f"```\n{chunk}\n```", ephemeral=True)
-
             guild_name = interaction.guild.name if interaction.guild else "Unknown"
             await log_action(str(interaction.user), guild_name, "PromptGenerated", prompt[:200])
 
-        # ── /build ───────────────────────────────────────────────────────────
         @self.tree.command(
             name="build",
-            description="Upload the AI's JSON blueprint file to build a server",
+            description="Preview and build a server from an uploaded JSON blueprint",
         )
         @app_commands.describe(
-            guild_id="The ID of the target guild to build in",
-            blueprint_file="The JSON file output by the local AI"
+            guild_id="ID of the server to build in",
+            blueprint_file="The .json blueprint generated by your local AI",
         )
-        async def build_cmd(interaction: discord.Interaction, guild_id: str, blueprint_file: discord.Attachment) -> None:
-            if not self._check_permissions(interaction):
-                await interaction.response.send_message(
-                    f"❌ You need one of these roles: {', '.join(config.BOT_ALLOWED_ROLES)}",
-                    ephemeral=True,
-                )
-                return
-
+        async def build_cmd(
+            interaction: discord.Interaction,
+            guild_id: str,
+            blueprint_file: discord.Attachment,
+        ) -> None:
             wait = self._check_rate_limit(interaction.user.id)
             if wait:
                 await interaction.response.send_message(
-                    f"⏳ Please wait {wait}s before using this command again.",
-                    ephemeral=True,
+                    f"Please wait {wait}s before using this command again.", ephemeral=True
                 )
                 return
-
-            # Validate guild_id format
             try:
                 guild_id_int = int(guild_id)
             except ValueError:
                 await interaction.response.send_message(
-                    "❌ Invalid guild ID — must be a number (e.g. `1234567890`).",
+                    "Invalid server ID. It must be a number.", ephemeral=True
+                )
+                return
+            target_guild = self.bot.get_guild(guild_id_int)
+            if target_guild is None:
+                await interaction.response.send_message(
+                    "I am not in that server, or the server ID is incorrect.", ephemeral=True
+                )
+                return
+            if not await self._can_manage_target(interaction, target_guild):
+                await interaction.response.send_message(
+                    "You must be an owner or an authorized server manager in the target server.",
+                    ephemeral=True,
+                )
+                return
+            bot_member = target_guild.me
+            if bot_member is None or not bot_member.guild_permissions.manage_channels or not bot_member.guild_permissions.manage_roles:
+                await interaction.response.send_message(
+                    "The bot needs Manage Channels and Manage Roles in the target server to build this blueprint.",
+                    ephemeral=True,
+                )
+                return
+            if not blueprint_file.filename.lower().endswith(".json"):
+                await interaction.response.send_message("Please upload a `.json` file.", ephemeral=True)
+                return
+            if blueprint_file.size > 2_000_000:
+                await interaction.response.send_message(
+                    "The blueprint must be smaller than 2 MB.", ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                raw_json = (await blueprint_file.read()).decode("utf-8")
+                blueprint = json.loads(raw_json)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+                await interaction.followup.send(
+                    f"Could not parse the JSON file: `{exc}`", ephemeral=True
+                )
+                return
+
+            existing_role_names: Set[str] = {role.name for role in target_guild.roles}
+            try:
+                is_valid, errors = validate(blueprint, existing_role_names=existing_role_names)
+            except RecursionError:
+                await interaction.followup.send(
+                    "The JSON blueprint is nested too deeply to process.", ephemeral=True
+                )
+                return
+            if not is_valid:
+                error_list = "\n".join(f"• {error}" for error in errors[:25])
+                remaining = len(errors) - 25
+                if remaining > 0:
+                    error_list += f"\n• …and {remaining} more validation issue(s)"
+                await interaction.followup.send(
+                    f"Blueprint validation failed:\n{error_list}", ephemeral=True
+                )
+                return
+            if blueprint.get("guild_settings") and not bot_member.guild_permissions.manage_guild:
+                await interaction.followup.send(
+                    "The blueprint changes server settings, so the bot also needs Manage Server.",
                     ephemeral=True,
                 )
                 return
 
-            # Look up the target guild
-            target_guild = self.bot.get_guild(guild_id_int)
-            if target_guild is None:
+            roles = blueprint.get("roles", [])
+            categories = blueprint.get("categories", [])
+            channels = [channel for category in categories for channel in category.get("channels", [])]
+            messages = blueprint.get("messages", [])
+            num_embeds = sum(
+                len(message.get("embeds", [])) + int("embed" in message)
+                for message in messages
+            )
+            num_reactions = sum(len(message.get("reactions", [])) for message in messages)
+            role_names = {role.name for role in target_guild.roles}
+            roles_to_update = sum(
+                role.get("name") in role_names
+                and role.get("update_existing", True)
+                and any(field in role for field in ("color", "hoist", "mentionable", "permissions"))
+                for role in roles
+            )
+            roles_to_create = sum(role.get("name") not in role_names for role in roles)
+            existing_categories = {category.name: category for category in target_guild.categories}
+            categories_found = sum(category.get("name") in existing_categories for category in categories)
+            categories_to_update = sum(
+                category.get("name") in existing_categories
+                and ("visible_to" in category or "permission_overwrites" in category)
+                for category in categories
+            )
+            categories_to_reuse = categories_found - categories_to_update
+            categories_to_create = len(categories) - categories_found
+            existing_channel_specs = [
+                (category, channel_def)
+                for category in categories
+                if category.get("name") in existing_categories
+                for channel_def in category.get("channels", [])
+                if any(
+                    channel.name == channel_def.get("name")
+                    for channel in existing_categories[category.get("name")].channels
+                )
+            ]
+            channel_settings = {
+                "topic", "slowmode", "nsfw", "bitrate", "user_limit",
+                "default_auto_archive_duration", "default_thread_slowmode_delay",
+            }
+            channels_to_update = sum(
+                ("visible_to" in category or "permission_overwrites" in category)
+                or bool(channel_def.get("visible_to") or channel_def.get("hidden_from"))
+                or "permission_overwrites" in channel_def
+                or any(field in channel_def for field in channel_settings)
+                for category, channel_def in existing_channel_specs
+            )
+            channels_to_reuse = len(existing_channel_specs) - channels_to_update
+            channels_to_create = len(channels) - len(existing_channel_specs)
+            if len(target_guild.roles) + roles_to_create > 250:
+                await interaction.followup.send(
+                    "This blueprint would exceed Discord's 250-role server limit.", ephemeral=True
+                )
+                return
+            if len(target_guild.categories) + categories_to_create > 50:
+                await interaction.followup.send(
+                    "This blueprint would exceed Discord's 50-category server limit.", ephemeral=True
+                )
+                return
+            if len(target_guild.channels) + categories_to_create + channels_to_create > 500:
+                await interaction.followup.send(
+                    "This blueprint would exceed Discord's 500-channel server limit.", ephemeral=True
+                )
+                return
+            permission_rules = sum(
+                len(category.get("permission_overwrites", {}))
+                + len(category.get("visible_to", []))
+                + sum(
+                    len(channel.get("permission_overwrites", {}))
+                    + len(channel.get("visible_to", []))
+                    + len(channel.get("hidden_from", []))
+                    for channel in category.get("channels", [])
+                )
+                for category in categories
+            )
+            settings = blueprint.get("guild_settings", {})
+            settings_preview = json.dumps(settings, ensure_ascii=False) if settings else "none"
+            preview_description = (
+                f"**Target:** {target_guild.name} (`{target_guild.id}`)\n"
+                f"**Blueprint:** {blueprint.get('server_name', '(unnamed)')}\n\n"
+            )
+            if blueprint.get("server_description"):
+                preview_description += f"**Description:** {blueprint['server_description']}\n"
+            preview_description += (
+                f"**Roles to create:** {roles_to_create}\n"
+                f"**Existing roles to configure:** {roles_to_update}\n"
+                    f"**Categories:** {categories_to_create} to create, {categories_to_update} to update, {categories_to_reuse} to reuse\n"
+                    f"**Channels:** {channels_to_create} to create, {channels_to_update} to update, {channels_to_reuse} to reuse\n"
+                f"**Role access rules:** {permission_rules}\n"
+                f"**Messages:** {len(messages)} ({num_embeds} embed(s), {num_reactions} reaction(s))\n"
+                f"**Guild settings to apply:** `{settings_preview}`"
+            )
+            embed = discord.Embed(
+                title="Server blueprint preview",
+                description=preview_description,
+                color=discord.Color.blurple(),
+            )
+            embed.set_footer(text="Review the target and changes, then approve or cancel.")
+            view = BuildConfirmView(owner_id=interaction.user.id)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await view.wait()
+
+            if view.value is None:
+                await interaction.followup.send("Build confirmation timed out.", ephemeral=True)
+                return
+            if not view.value:
+                return
+
+            response_interaction = view.response_interaction or interaction
+            await response_interaction.followup.send(
+                f"Building **{blueprint.get('server_name', 'your server')}** in **{target_guild.name}**…",
+                ephemeral=True,
+            )
+            success, summary = await build_server(target_guild, blueprint)
+            if len(summary) > 1850:
+                summary = summary[:1850] + "\n…(report truncated)"
+            await response_interaction.followup.send(
+                f"{'✅' if success else '⚠️'} **Build {'complete' if success else 'finished with issues'}**\n\n{summary}",
+                ephemeral=True,
+            )
+            if success:
+                await log_action(
+                    str(interaction.user), target_guild.name, "ServerBuilt",
+                    f"Applied '{blueprint.get('server_name', 'unnamed')}' to guild {target_guild.id}",
+                )
+            else:
+                await log_error(
+                    str(interaction.user), target_guild.name, "BuildPartialFailure", summary[:500]
+                )
+
+        @self.tree.command(
+            name="nuke",
+            description="Remove all manageable server structure after two confirmations",
+        )
+        @app_commands.describe(confirmation="Type NUKE followed by this server's ID")
+        async def nuke_cmd(interaction: discord.Interaction, confirmation: str) -> None:
+            guild = interaction.guild
+            member = interaction.user
+            if guild is None or not isinstance(member, discord.Member):
+                await interaction.response.send_message("Run `/nuke` inside the server you want to clear.", ephemeral=True)
+                return
+            if member.id != guild.owner_id and not member.guild_permissions.administrator:
                 await interaction.response.send_message(
-                    f"❌ I'm not in a guild with ID `{guild_id_int}`, or that ID is wrong.\n"
-                    "Make sure the bot has been added to that server.",
+                    "Only the server owner or an administrator can use `/nuke`.", ephemeral=True
+                )
+                return
+            expected = f"NUKE {guild.id}"
+            if confirmation.strip() != expected:
+                await interaction.response.send_message(
+                    f"Confirmation did not match. Type exactly `{expected}` to preview the deletion.",
+                    ephemeral=True,
+                )
+                return
+            wait = self._check_rate_limit(interaction.user.id)
+            if wait:
+                await interaction.response.send_message(
+                    f"Please wait {wait}s before using this command again.", ephemeral=True
+                )
+                return
+            bot_member = guild.me
+            if bot_member is None or not bot_member.guild_permissions.manage_channels or not bot_member.guild_permissions.manage_roles:
+                await interaction.response.send_message(
+                    "The bot needs Manage Channels and Manage Roles to clear server structure.",
                     ephemeral=True,
                 )
                 return
 
             await interaction.response.defer(ephemeral=True, thinking=True)
-
-            if not blueprint_file.filename.endswith('.json'):
-                await interaction.followup.send("❌ Please upload a .json file.", ephemeral=True)
-                return
-            
-            try:
-                raw_bytes = await blueprint_file.read()
-                raw_json = raw_bytes.decode('utf-8')
-                blueprint = json.loads(raw_json)
-            except Exception as exc:
-                await interaction.followup.send(
-                    f"❌ Failed to parse JSON file: `{exc}`\nPlease check the file from your local AI.",
-                    ephemeral=True,
-                )
-                return
-
-            # Validate blueprint
-            is_valid, errors = validate(blueprint)
-            if not is_valid:
-                error_list = "\n".join(f"• {e}" for e in errors[:20])
-                await interaction.followup.send(
-                    f"❌ Blueprint validation failed:\n{error_list}",
-                    ephemeral=True,
-                )
-                return
-
-            # Show preview embed
-            server_name = blueprint.get("server_name", "(unnamed)")
-            server_desc = blueprint.get("server_description", "")
-            num_roles = len(blueprint.get("roles", []))
-            num_cats = len(blueprint.get("categories", []))
-            num_channels = sum(
-                len(c.get("channels", []))
-                for c in blueprint.get("categories", [])
-            )
-            num_msgs = len(blueprint.get("messages", []))
-
+            plan, limitations = await prepare_nuke(guild)
             embed = discord.Embed(
-                title="🏗️ Server Blueprint Preview",
+                title=f"Confirm clearing {guild.name}",
                 description=(
-                    f"**Target Guild:** {target_guild.name} (`{target_guild.id}`)\n\n"
-                    f"**Server Name:** {server_name}\n"
-                    f"**Description:** {server_desc or '—'}\n\n"
-                    f"**Roles:** {num_roles}\n"
-                    f"**Categories:** {num_cats}\n"
-                    f"**Channels:** {num_channels}\n"
-                    f"**Messages:** {num_msgs}"
+                    format_nuke_preview(plan, limitations)
+                    + "\n\nThis removes channels and their message history, removable roles, "
+                    "custom emoji, stickers, and scheduled events. Server members and the server itself are retained."
                 ),
-                color=discord.Color.blurple(),
+                color=discord.Color.red(),
             )
-            embed.set_footer(text="Click ✅ Approve to build or ❌ Cancel to abort.")
-
-            view = BuildConfirmView(owner_id=interaction.user.id)
+            embed.set_footer(text="This cannot be undone. The final button must be clicked by you.")
+            view = NukeConfirmView(owner_id=interaction.user.id)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
             await view.wait()
 
             if view.value is None:
-                await interaction.followup.send(
-                    "⏰ Confirmation timed out. Please run `/build` again.", ephemeral=True
-                )
+                await interaction.followup.send("Nuke confirmation timed out; nothing was deleted.", ephemeral=True)
                 return
-
             if not view.value:
-                # User clicked Cancel
                 return
 
-            # ── Build ─────────────────────────────────────────────────────
-            resp_interaction = view.response_interaction or interaction
-            try:
-                await resp_interaction.followup.send(
-                    f"⚙️ Building **{server_name}** in **{target_guild.name}**…",
-                    ephemeral=True,
-                )
-            except Exception:
-                pass
+            response_interaction = view.response_interaction or interaction
+            await response_interaction.followup.send(
+                f"Clearing server structure in **{guild.name}**…", ephemeral=True
+            )
+            success, summary = await nuke_server(plan)
+            if len(summary) > 1850:
+                summary = summary[:1850] + "\n…(report truncated)"
+            await response_interaction.followup.send(
+                f"{'✅' if success else '⚠️'} **Server clear {'complete' if success else 'finished with issues'}**\n\n{summary}",
+                ephemeral=True,
+            )
+            await log_action(
+                str(interaction.user), guild.name, "ServerNuked", f"Deleted server structure in guild {guild.id}"
+            )
 
-            success, summary = await build_server(target_guild, blueprint)
-
-            # Truncate summary for Discord's 2000-char limit
-            if len(summary) > 1900:
-                summary = summary[:1900] + "\n…(truncated)"
-
-            status_emoji = "✅" if success else "⚠️"
-            try:
-                await resp_interaction.followup.send(
-                    f"{status_emoji} **Build complete for {server_name}**\n\n{summary}",
-                    ephemeral=True,
-                )
-            except Exception:
-                pass
-
-            guild_name = interaction.guild.name if interaction.guild else "Unknown"
-            if success:
-                await log_action(
-                    str(interaction.user), guild_name,
-                    "ServerBuilt", f"Built '{server_name}' in guild {target_guild.id}"
-                )
-            else:
-                await log_error(
-                    str(interaction.user), guild_name,
-                    "BuildPartialFailure", summary[:500]
-                )
-
-        # ── /reset ───────────────────────────────────────────────────────────
         @self.tree.command(name="reset", description="Clear your current session")
         async def reset_cmd(interaction: discord.Interaction) -> None:
             if not self._check_permissions(interaction):
                 await interaction.response.send_message(
-                    f"❌ You need one of these roles: {', '.join(config.BOT_ALLOWED_ROLES)}",
-                    ephemeral=True,
+                    "You need Manage Server or one of the configured allowed roles.", ephemeral=True
                 )
                 return
-            # No persistent state to clear in this bot, but kept for UX consistency
             await interaction.response.send_message(
-                "✅ Session reset. You can start fresh with `/create`.", ephemeral=True
+                "Session reset. You can start fresh with `/create`.", ephemeral=True
             )
 
     async def sync_commands(self, guild_id: Optional[int] = None) -> None:
@@ -263,15 +406,10 @@ class CommandCore:
             guild_obj = discord.Object(id=guild_id)
             self.tree.copy_global_to(guild=guild_obj)
             await self.tree.sync(guild=guild_obj)
-            logger.info(f"Commands synced to guild {guild_id}")
+            logger.info("Commands synced to guild %s", guild_id)
         else:
             await self.tree.sync()
             logger.info("Commands synced globally")
 
 
-# ================================================
-# Copyright (c) 2025 TIS199
-# Licensed for Educational and Testing Use Only.
-# Redistribution or commercial use is strictly prohibited.
-# GitHub: https://github.com/TIS199
-# ================================================
+# Copyright (c) 2025 TIS199 — Educational and Testing Use Only.

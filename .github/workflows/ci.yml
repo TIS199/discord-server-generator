@@ -28,7 +28,7 @@ jobs:
       - name: Syntax check (py_compile)
         run: |
           python -m py_compile bot.py config.py
-          python -m py_compile src/logger.py src/prompt_builder.py src/validator.py src/builder.py src/views.py src/commands.py
+          python -m py_compile src/*.py
           echo "✅ All files compiled without syntax errors"
 
       - name: Optional flake8 style check

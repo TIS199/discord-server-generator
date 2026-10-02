@@ -22,7 +22,6 @@ from src.logger import logger
 
 
 intents = discord.Intents.default()
-intents.message_content = True
 intents.guilds = True
 intents.members = True
 
@@ -43,6 +42,7 @@ async def on_ready() -> None:
     logger.info("🚀 Discord Server Generator is ready!")
     logger.info("   /create <prompt>  — generate local-AI instruction set")
     logger.info("   /build  <guild_id> — paste blueprint JSON and build")
+    logger.info("   /nuke <confirmation> — clear server structure after confirmation")
     logger.info("   /reset             — clear session")
 
 
