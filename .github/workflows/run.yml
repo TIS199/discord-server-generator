@@ -1,0 +1,38 @@
+name: Run Bot (Manual — up to 6 hours)
+
+on:
+  workflow_dispatch:
+    inputs:
+      allowed_roles:
+        description: "Comma-separated allowed role names (overrides secret default)"
+        required: false
+        default: ""
+
+jobs:
+  run-bot:
+    name: Start Discord Server Generator
+    runs-on: ubuntu-latest
+    # GitHub-hosted jobs time out at 6 hours
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          BOT_ALLOWED_ROLES: ${{ inputs.allowed_roles || secrets.BOT_ALLOWED_ROLES || 'Administrator,Moderator' }}
+          LOG_WEBHOOK_URL: ${{ secrets.LOG_WEBHOOK_URL }}
+          RATE_LIMIT_SECONDS: ${{ secrets.RATE_LIMIT_SECONDS || '10' }}
+        run: python bot.py

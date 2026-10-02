@@ -1,0 +1,46 @@
+name: Deploy to VPS (Production)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: SSH deploy & systemd restart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            cd ~/discord-server-generator
+
+            # Pull latest code
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Update dependencies in the virtual environment
+            source .venv/bin/activate
+            pip install -r requirements.txt --quiet
+
+            # Write environment variables from GitHub Secrets into .env
+            cat > .env <<ENVEOF
+            DISCORD_BOT_TOKEN=${{ secrets.DISCORD_BOT_TOKEN }}
+            BOT_ALLOWED_ROLES=${{ secrets.BOT_ALLOWED_ROLES || 'Administrator,Moderator' }}
+            LOG_WEBHOOK_URL=${{ secrets.LOG_WEBHOOK_URL }}
+            RATE_LIMIT_SECONDS=${{ secrets.RATE_LIMIT_SECONDS || '10' }}
+            ENVEOF
+
+            # Restart the systemd service
+            sudo systemctl restart discord-server-generator
+            echo "✅ Deployed and restarted successfully"
