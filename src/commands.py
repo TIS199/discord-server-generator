@@ -19,7 +19,7 @@ from src.logger import logger, log_action, log_error
 from src.prompt_builder import build_prompt
 from src.validator import validate
 from src.builder import build_server
-from src.views import BlueprintModal, BuildConfirmView
+from src.views import BuildConfirmView
 
 
 class CommandCore:
@@ -84,7 +84,7 @@ class CommandCore:
             await interaction.followup.send(
                 "📋 **Instruction set generated!**\n"
                 "Copy the text below and paste it into your local AI (Ollama, LM Studio, etc.).\n"
-                "Then use `/build <guild_id>` to paste the AI's JSON output back here.",
+                "Then use `/build <guild_id>` to upload the AI's JSON output back here.",
                 ephemeral=True,
             )
 
@@ -97,10 +97,13 @@ class CommandCore:
         # ── /build ───────────────────────────────────────────────────────────
         @self.tree.command(
             name="build",
-            description="Paste the AI's JSON blueprint to build a server",
+            description="Upload the AI's JSON blueprint file to build a server",
         )
-        @app_commands.describe(guild_id="The ID of the target guild to build in")
-        async def build_cmd(interaction: discord.Interaction, guild_id: str) -> None:
+        @app_commands.describe(
+            guild_id="The ID of the target guild to build in",
+            blueprint_file="The JSON file output by the local AI"
+        )
+        async def build_cmd(interaction: discord.Interaction, guild_id: str, blueprint_file: discord.Attachment) -> None:
             if not self._check_permissions(interaction):
                 await interaction.response.send_message(
                     f"❌ You need one of these roles: {', '.join(config.BOT_ALLOWED_ROLES)}",
@@ -136,29 +139,19 @@ class CommandCore:
                 )
                 return
 
-            # Open modal for blueprint JSON
-            modal = BlueprintModal(guild_id=guild_id_int)
-            await interaction.response.send_modal(modal)
+            await interaction.response.defer(ephemeral=True, thinking=True)
 
-            submitted = await modal.wait_for_submit(timeout=300.0)
-            if not submitted or not modal.submitted_text:
-                try:
-                    await interaction.followup.send(
-                        "⏰ Timed out waiting for blueprint. Please run `/build` again.",
-                        ephemeral=True,
-                    )
-                except Exception:
-                    pass
+            if not blueprint_file.filename.endswith('.json'):
+                await interaction.followup.send("❌ Please upload a .json file.", ephemeral=True)
                 return
-
-            raw_json = modal.submitted_text.strip()
-
-            # Parse JSON
+            
             try:
+                raw_bytes = await blueprint_file.read()
+                raw_json = raw_bytes.decode('utf-8')
                 blueprint = json.loads(raw_json)
-            except json.JSONDecodeError as exc:
+            except Exception as exc:
                 await interaction.followup.send(
-                    f"❌ Invalid JSON: `{exc}`\nPlease check the output from your local AI.",
+                    f"❌ Failed to parse JSON file: `{exc}`\nPlease check the file from your local AI.",
                     ephemeral=True,
                 )
                 return
@@ -182,6 +175,7 @@ class CommandCore:
                 len(c.get("channels", []))
                 for c in blueprint.get("categories", [])
             )
+            num_msgs = len(blueprint.get("messages", []))
 
             embed = discord.Embed(
                 title="🏗️ Server Blueprint Preview",
@@ -191,7 +185,8 @@ class CommandCore:
                     f"**Description:** {server_desc or '—'}\n\n"
                     f"**Roles:** {num_roles}\n"
                     f"**Categories:** {num_cats}\n"
-                    f"**Channels:** {num_channels}"
+                    f"**Channels:** {num_channels}\n"
+                    f"**Messages:** {num_msgs}"
                 ),
                 color=discord.Color.blurple(),
             )
@@ -209,7 +204,7 @@ class CommandCore:
                 return
 
             if not view.value:
-                # User clicked Cancel — already handled in the view
+                # User clicked Cancel
                 return
 
             # ── Build ─────────────────────────────────────────────────────

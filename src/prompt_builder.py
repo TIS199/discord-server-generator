@@ -44,6 +44,15 @@ BLUEPRINT_SCHEMA = {
             ],
         }
     ],
+    "messages": [
+        {
+            "channel": "string — name of the channel to send the message in",
+            "content": "string — the message text to send",
+            "use_webhook": "bool (optional, default false) — use a webhook to send the message",
+            "webhook_name": "string (optional) — name of the webhook/bot if use_webhook is true",
+            "webhook_avatar_url": "string (optional) — URL to image for webhook avatar"
+        }
+    ]
 }
 
 _RULES = """
@@ -95,6 +104,15 @@ _EXAMPLE = {
             ],
         },
     ],
+    "messages": [
+        {
+            "channel": "rules",
+            "content": "Welcome to Pixel Squad! Please follow all rules.",
+            "use_webhook": True,
+            "webhook_name": "Server Guide",
+            "webhook_avatar_url": "https://i.imgur.com/example.png"
+        }
+    ]
 }
 
 

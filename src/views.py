@@ -10,43 +10,6 @@ import discord
 from typing import Optional
 
 
-class BlueprintModal(discord.ui.Modal, title="Paste AI Blueprint JSON"):
-    """Text input modal where the user pastes the local AI's JSON output."""
-
-    blueprint_input = discord.ui.TextInput(
-        label="JSON Blueprint",
-        style=discord.TextStyle.paragraph,
-        placeholder='{"server_name": "...", "roles": [...], "categories": [...]}',
-        required=True,
-        max_length=4000,
-    )
-
-    def __init__(self, guild_id: int) -> None:
-        super().__init__()
-        self.guild_id = guild_id
-        self.submitted_text: Optional[str] = None
-        self._event = asyncio.Event()
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        self.submitted_text = self.blueprint_input.value
-        # Defer so we can send follow-ups from outside this modal
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        self._event.set()
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        await interaction.response.send_message(
-            f"❌ An error occurred: {error}", ephemeral=True
-        )
-        self._event.set()
-
-    async def wait_for_submit(self, timeout: float = 300.0) -> bool:
-        try:
-            await asyncio.wait_for(self._event.wait(), timeout=timeout)
-            return self.submitted_text is not None
-        except asyncio.TimeoutError:
-            return False
-
-
 class BuildConfirmView(discord.ui.View):
     """Approve / Cancel buttons shown after validating the blueprint."""
 

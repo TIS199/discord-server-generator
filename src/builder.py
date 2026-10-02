@@ -9,7 +9,10 @@ import asyncio
 from typing import Dict, List, Optional, Tuple
 
 import discord
+import discord
 
+from src.logger import logger
+from src.sender import process_messages
 from src.logger import logger
 
 
@@ -219,6 +222,16 @@ async def build_server(
 
             # Small delay to avoid hitting Discord rate limits
             await asyncio.sleep(0.4)
+
+    # ── 3. Process messages & webhooks ──────────────────────────────────────
+    messages_def = blueprint.get("messages", [])
+    if messages_def:
+        msg_results = await process_messages(guild, messages_def)
+        for msg_res in msg_results:
+            if msg_res.startswith("  ✅"):
+                result.ok(msg_res[4:].strip())
+            else:
+                result.fail(msg_res[4:].strip(), "Webhook/Message failed")
 
     return result.success, result.summary()
 

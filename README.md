@@ -9,13 +9,13 @@ A Discord bot that builds entire servers from a plain-English prompt — powered
          │
     Bot outputs a structured prompt (copy it)
          │
-  Paste into local AI → get JSON blueprint
+  Paste into local AI → get JSON blueprint file
          │
-    /build <guild_id>  (paste the JSON)
+    /build <guild_id> <blueprint.json> (upload the file)
          │
   Bot validates → shows preview → you approve
          │
-    Channels, categories & roles are created ✅
+    Channels, categories, roles & messages are created ✅
 ```
 
 ## Commands
@@ -23,7 +23,7 @@ A Discord bot that builds entire servers from a plain-English prompt — powered
 | Command | Description |
 |---|---|
 | `/create <prompt>` | Generates the instruction-set text to paste into your local AI |
-| `/build <guild_id>` | Opens a modal — paste the AI's JSON; bot builds the server |
+| `/build <guild_id> <blueprint_file>` | Upload the AI's JSON file; bot validates and builds the server |
 | `/reset` | Clears your session |
 
 ## Setup
@@ -135,12 +135,17 @@ Your local AI must return a JSON object matching this structure:
           "nsfw": false,
           "visible_to": [],
           "hidden_from": []
-        },
-        {
-          "name": "lobby",
-          "type": "voice"
         }
       ]
+    }
+  ],
+  "messages": [
+    {
+      "channel": "general-chat",
+      "content": "Welcome to the server! Please read the rules.",
+      "use_webhook": true,
+      "webhook_name": "Server Guide",
+      "webhook_avatar_url": "https://i.imgur.com/example.png"
     }
   ]
 }
@@ -162,6 +167,7 @@ When adding the bot to a server, grant:
 - Manage Roles
 - View Channels
 - Send Messages
+- Manage Webhooks
 
 ---
 
